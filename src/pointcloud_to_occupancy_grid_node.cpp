@@ -1,149 +1,142 @@
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <nav_msgs/msg/occupancy_grid.hpp>
-#include <nav_msgs/msg/odometry.hpp>
+// ground_segmentation_node.cpp
+#include <memory>
+#define DEG2RAD(x) ((x) * M_PI / 180.0)
+
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
+// 加载带颜色点类型
 #include <pcl/point_types.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>  // 使用新的头文件
 
-#include <geometry_msgs/msg/pose.hpp>
-#include <tf2/LinearMath/Quaternion.h>  // 引入四元数库
-#include <geometry_msgs/msg/pose.hpp>   // 引入几何消息库
-using PointT = pcl::PointXYZ;
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
 
-class PointCloudToOccupancyGridNode : public rclcpp::Node {
+using PointInT = pcl::PointXYZI;    // 原始点云类型
+using PointRGBT = pcl::PointXYZRGB; // 带颜色点云类型
+
+class GroundSegmentationNode : public rclcpp::Node
+{
 public:
-  PointCloudToOccupancyGridNode() : Node("pointcloud_to_occupancy_grid_node") {
-  
+  GroundSegmentationNode() : Node("ground_segmentation_node")
+  {
+    // 订阅点云
+    sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      "/cloud_registered", 10,
+      std::bind(&GroundSegmentationNode::pointcloud_callback, this, std::placeholders::_1));
 
-    // 订阅里程计话题
-    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      "/odom", 10,
-      std::bind(&PointCloudToOccupancyGridNode::odom_callback, this, std::placeholders::_1));
+    // 发布带颜色地面点云
+    pub_ground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("ground_points_colored", 10);
+    // 发布带颜色非地面点云
+    pub_non_ground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("non_ground_points_colored", 10);
 
-    // 订阅障碍物点云话题
-    sub_obstacle_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/obstacle_points_colored", 10,
-      std::bind(&PointCloudToOccupancyGridNode::obstacle_callback, this, std::placeholders::_1));
-
-    // 订阅地面点云话题
-    sub_ground_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/ground_points_colored", 10,
-      std::bind(&PointCloudToOccupancyGridNode::ground_callback, this, std::placeholders::_1));
-
-    // 发布栅格图
-    pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("pointcloud_occupancy_grid", 10);
-
-    declare_parameter("grid_resolution", 0.1);  // 每格0.1米
-    declare_parameter("grid_width", 500);       // 20m x 20m
-    declare_parameter("grid_height", 500);
-    declare_parameter("min_z", -100.0);
-    declare_parameter("max_z", 100.0);
-
-    RCLCPP_INFO(this->get_logger(), "PointCloud to OccupancyGrid node started.");
+    RCLCPP_INFO(this->get_logger(), "Ground Segmentation Node started.");
   }
 
 private:
-  // 里程计回调，获取当前位置和姿态
-  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    current_position_ = msg->pose.pose.position;
-    current_orientation_ = msg->pose.pose.orientation;
-  }
-
-  // 障碍物点云回调
-  void obstacle_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    process_pointcloud(msg, 100);  // 障碍物用黑色表示
-  }
-
-  // 地面点云回调
-  void ground_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-    process_pointcloud(msg, 0);    // 地面用白色表示
-  }
-
-  // 点云处理函数
-  void process_pointcloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg, int occupancy_value) {
-    // 获取参数
-    double resolution = get_parameter("grid_resolution").as_double();
-    int width = get_parameter("grid_width").as_int();
-    int height = get_parameter("grid_height").as_int();
-    float min_z = get_parameter("min_z").as_double();
-    float max_z = get_parameter("max_z").as_double();
-
-    pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
-    pcl::fromROSMsg(*msg, *cloud);
+  void pointcloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg)
+  {
+    // 转成 PCL 原始点云格式
+    pcl::PointCloud<PointInT>::Ptr cloud(new pcl::PointCloud<PointInT>);
+    pcl::fromROSMsg(*cloud_msg, *cloud);
 
     if (cloud->empty()) {
-      RCLCPP_WARN(this->get_logger(), "Received empty point cloud.");
+      RCLCPP_WARN(this->get_logger(), "Received empty point cloud");
       return;
     }
 
-    // 初始化地图
-    std::vector<int8_t> grid(width * height, 50);  // 初始值设置为50（灰色，未知）
+    // 创建 SACSegmentation 对象进行平面拟合
+    pcl::SACSegmentation<PointInT> seg;
+    pcl::PointIndices::Ptr ground_inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
 
-    // 将点云数据转换到世界坐标系
-    for (const auto& pt : cloud->points) {
-      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-      if (pt.z < min_z || pt.z > max_z) continue;
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
 
-      // 先旋转，再平移
-      // 将四元数转换为旋转矩阵
-      tf2::Quaternion quat(current_orientation_.x, current_orientation_.y,
-                          current_orientation_.z, current_orientation_.w);
-      tf2::Matrix3x3 rot_matrix(quat);
+    seg.setMethodType(pcl::SAC_RANSAC);
+    seg.setDistanceThreshold(0.07); // 距离阈值，可调节，单位米地面拟合容差不超过 15cm
+    seg.setMaxIterations(2000);    
+    seg.setInputCloud(cloud);
+    seg.segment(*ground_inliers, *coefficients);
 
-      // 创建 tf2::Vector3 来表示点
-      tf2::Vector3 point(pt.x, pt.y, pt.z);
-
-      // 应用旋转
-      tf2::Vector3 rotated_point = rot_matrix * point;
-
-      // 然后应用平移
-      double world_x = rotated_point.x() + current_position_.x;
-      double world_y = rotated_point.y() + current_position_.y;
-      double world_z = rotated_point.z() + current_position_.z;
-
-      // 将转换后的点云坐标映射到栅格中
-      int x_idx = static_cast<int>((world_x + (width * resolution) / 2.0) / resolution);
-      int y_idx = static_cast<int>((world_y + (height * resolution) / 2.0) / resolution);
-
-      if (x_idx >= 0 && x_idx < width && y_idx >= 0 && y_idx < height) {
-        int idx = y_idx * width + x_idx;
-        grid[idx] = occupancy_value;  // 设置为障碍物或地面
-      }
+    if (ground_inliers->indices.empty()) {
+      RCLCPP_WARN(this->get_logger(), "No ground plane found.");
+      // 全部视为非地面，赋红色发布
+      auto cloud_non_ground_rgb = convertToColoredCloud(cloud, 255, 0, 0);
+      publishCloud(cloud_non_ground_rgb, cloud_msg->header, pub_non_ground_);
+      return;
     }
 
-    // 发布栅格地图
-    nav_msgs::msg::OccupancyGrid occ;
-    occ.header.stamp = this->get_clock()->now();
-    occ.header.frame_id = msg->header.frame_id;
+    // 根据inliers提取地面点云索引，用于赋绿
+    pcl::ExtractIndices<PointInT> extract;
+    pcl::PointCloud<PointInT>::Ptr cloud_ground(new pcl::PointCloud<PointInT>);
+    extract.setInputCloud(cloud);
+    extract.setIndices(ground_inliers);
+    extract.setNegative(false);
+    extract.filter(*cloud_ground);
 
-    occ.info.resolution = resolution;
-    occ.info.width = width;
-    occ.info.height = height;
-    occ.info.origin.position.x = -width * resolution / 2.0 + current_position_.x;
-    occ.info.origin.position.y = -height * resolution / 2.0 + current_position_.y;
-    occ.info.origin.position.z = 0.0;
-    occ.info.origin.orientation = current_orientation_;
+    // 非地面点云
+    pcl::PointCloud<PointInT>::Ptr cloud_non_ground(new pcl::PointCloud<PointInT>);
+    extract.setNegative(true);
+    extract.filter(*cloud_non_ground);
 
-    occ.data = grid;
+    // 转成带颜色点云，赋颜色
+    auto cloud_ground_rgb = convertToColoredCloud(cloud_ground, 0, 255, 0);     // 绿地面
+    auto cloud_non_ground_rgb = convertToColoredCloud(cloud_non_ground, 255, 0, 0); // 红非地面
 
-    pub_->publish(occ);
+    // 发布
+    publishCloud(cloud_ground_rgb, cloud_msg->header, pub_ground_);
+    publishCloud(cloud_non_ground_rgb, cloud_msg->header, pub_non_ground_);
   }
 
-  // 订阅的里程计位置
-  geometry_msgs::msg::Point current_position_;
-  geometry_msgs::msg::Quaternion current_orientation_;
+  // 将不带颜色的点云转成带颜色点云并赋值RGB
+  pcl::PointCloud<PointRGBT>::Ptr convertToColoredCloud(
+    const pcl::PointCloud<PointInT>::Ptr & input_cloud,
+    uint8_t r, uint8_t g, uint8_t b)
+  {
+    pcl::PointCloud<PointRGBT>::Ptr colored_cloud(new pcl::PointCloud<PointRGBT>);
+    colored_cloud->points.reserve(input_cloud->points.size());
 
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_obstacle_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_ground_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_;
+    for (const auto &pt : input_cloud->points) {
+      PointRGBT p;
+      p.x = pt.x;
+      p.y = pt.y;
+      p.z = pt.z;
+      p.r = r;
+      p.g = g;
+      p.b = b;
+      colored_cloud->points.push_back(p);
+    }
+
+    colored_cloud->width = static_cast<uint32_t>(colored_cloud->points.size());
+    colored_cloud->height = 1;
+    colored_cloud->is_dense = input_cloud->is_dense;
+
+    return colored_cloud;
+  }
+
+  void publishCloud(
+    pcl::PointCloud<PointRGBT>::Ptr cloud,
+    const std_msgs::msg::Header & header,
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub)
+  {
+    sensor_msgs::msg::PointCloud2 output;
+    pcl::toROSMsg(*cloud, output);
+    output.header = header;
+    pub->publish(output);
+  }
+
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_non_ground_;
 };
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<PointCloudToOccupancyGridNode>());
+  auto node = std::make_shared<GroundSegmentationNode>();
+  rclcpp::spin(node);
   rclcpp::shutdown();
   return 0;
 }
