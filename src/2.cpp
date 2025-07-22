@@ -6,6 +6,9 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>  // 使用新的头文件
+#include <vector>
+#include <queue>
+#include <utility>  // for std::pair
 
 #include <geometry_msgs/msg/pose.hpp>
 #include <tf2/LinearMath/Quaternion.h>  // 引入四元数库
@@ -57,10 +60,10 @@ public:
     declare_parameter("grid_resolution", 0.2); // 每格0.1米
     declare_parameter("grid_width", 100);       // 20m x 20m
     declare_parameter("grid_height", 100);
-    declare_parameter("min_z", odom_z-1);
+    declare_parameter("min_z", odom_z-6);
     declare_parameter("max_z", odom_z+1);
 
-    RCLCPP_INFO(this->get_logger(), "PointCloud to OccupancyGrid node started.");
+    RCLCPP_INFO(this->get_logger(), "odom_z-3=%f,odom_z+0.1=%f",odom_z-3,odom_z+0.1);
   }
   std::vector<int8_t> occupancy_grid_;
   std::vector<int8_t> new_grid;
@@ -73,9 +76,10 @@ private:
   nav_msgs::msg::Odometry::SharedPtr msg2;
   void update_global_map(const sensor_msgs::msg::PointCloud2::SharedPtr msg,
                        int8_t occupancy_value) {
+
   pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
   pcl::fromROSMsg(*msg, *cloud);
-
+  // RCLCPP_INFO(this->get_logger(), "odom_z-6=%f,odom_z+1=%f",odom_z-6,odom_z+1);
   double resolution = get_parameter("grid_resolution").as_double();
   float min_z = get_parameter("min_z").as_double();
   float max_z = get_parameter("max_z").as_double();
@@ -83,7 +87,7 @@ private:
   int height_ = get_parameter("grid_height").as_int();
   for (const auto& pt : cloud->points) {
     if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-    if (pt.z < min_z || pt.z > max_z) continue;
+    if (pt.z-odom_z < -1.5|| pt.z - odom_z > -0.1) continue;
 
     // 将点云投影到全局地图
     double world_x = (pt.x);
@@ -95,6 +99,52 @@ private:
     global_occupancy_map_[{gx, gy}] = occupancy_value;
   }
 }
+#include <queue>
+
+void remove_isolated_obstacles(std::vector<int8_t>& grid, int width, int height, int min_obstacle_size = 5) {
+  std::vector<bool> visited(width * height, false);
+  const int dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
+  const int dy[8] = {0, -1, -1, -1, 0, 1, 1, 1};
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      int idx = y * width + x;
+      if (grid[idx] == 100 && !visited[idx]) {
+        // 找到新的障碍块，进行 flood fill
+        std::queue<std::pair<int, int>> q;
+        std::vector<int> obstacle_indices;
+        q.push({x, y});
+        visited[idx] = true;
+        obstacle_indices.push_back(idx);
+
+        while (!q.empty()) {
+          auto [cx, cy] = q.front(); q.pop();
+
+          for (int i = 0; i < 8; ++i) {
+            int nx = cx + dx[i];
+            int ny = cy + dy[i];
+
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            int nidx = ny * width + nx;
+            if (!visited[nidx] && grid[nidx] == 100) {
+              visited[nidx] = true;
+              q.push({nx, ny});
+              obstacle_indices.push_back(nidx);
+            }
+          }
+        }
+
+        // 如果障碍块太小，就去除它
+        if (obstacle_indices.size() < min_obstacle_size) {
+          for (int i : obstacle_indices) {
+            grid[i] = 50; // 标记为 free
+          }
+        }
+      }
+    }
+  }
+}
+
 void timer_callback() {
   double resolution = get_parameter("grid_resolution").as_double();
   int width = get_parameter("grid_width").as_int();
@@ -122,33 +172,95 @@ void timer_callback() {
           int idx = y * width + x;
           int8_t cell = local_grid[idx];  // 当前格子的值
           // RCLCPP_INFO(this->get_logger(), "Occupied cell at (%d, %d) has  nearby free cells", i, j);
-          if (cell == 100) {
-                  int not_free_count = 0;
-                  // 检查距离1~3范围内8个方向的格子
-                for(int i = 1;i<=3;i++){
-                    if (local_grid[(y - i) * width + x] != 50 && local_grid[(y - i) * width + x] != 100) ++not_free_count;
-                    // 下
-                    if (local_grid[(y + i) * width + x] != 50 && local_grid[(y + i) * width + x] != 100) ++not_free_count;
-                    // 左
-                    if (local_grid[y * width + (x - i)] != 50 && local_grid[y * width + (x - i)] != 100) ++not_free_count;
-                    // 右
-                    if (local_grid[y * width + (x + i)] != 50 && local_grid[y * width + (x + i)] != 100) ++not_free_count;
-                    // 左上
-                    if (local_grid[(y - i) * width + (x - i)] != 50 && local_grid[(y - i) * width + (x - i)] != 100) ++not_free_count;
-                    // 右上
-                    if (local_grid[(y - i) * width + (x + i)] != 50 && local_grid[(y - i) * width + (x + i)] != 100) ++not_free_count;
-                    // 左下
-                    if (local_grid[(y + i) * width + (x - i)] != 50 && local_grid[(y + i) * width + (x - i)] != 100) ++not_free_count;
-                    // 右下
-                    if (local_grid[(y + i) * width + (x + i)] != 50 && local_grid[(y + i) * width + (x + i)] != 100) ++not_free_count;
-                }
-                  if(not_free_count>=18){
-                    RCLCPP_INFO(this->get_logger(), "Occupied cell at (%d, %d) has  nearby free cells", not_free_count, not_free_count);
-                    local_grid[idx] = 0;  // 转为空闲
-                  }
-        }
+        //   if (cell == 100) {
+        //           int not_free_count = 0;
+        //           // 检查距离1~3范围内8个方向的格子
+        //         for(int i = 1;i<=3;i++){
+        //             if (local_grid[(y - i) * width + x] != 50 && local_grid[(y - i) * width + x] != 100) ++not_free_count;
+        //             // 下
+        //             if (local_grid[(y + i) * width + x] != 50 && local_grid[(y + i) * width + x] != 100) ++not_free_count;
+        //             // 左
+        //             if (local_grid[y * width + (x - i)] != 50 && local_grid[y * width + (x - i)] != 100) ++not_free_count;
+        //             // 右
+        //             if (local_grid[y * width + (x + i)] != 50 && local_grid[y * width + (x + i)] != 100) ++not_free_count;
+        //             // 左上
+        //             if (local_grid[(y - i) * width + (x - i)] != 50 && local_grid[(y - i) * width + (x - i)] != 100) ++not_free_count;
+        //             // 右上
+        //             if (local_grid[(y - i) * width + (x + i)] != 50 && local_grid[(y - i) * width + (x + i)] != 100) ++not_free_count;
+        //             // 左下
+        //             if (local_grid[(y + i) * width + (x - i)] != 50 && local_grid[(y + i) * width + (x - i)] != 100) ++not_free_count;
+        //             // 右下
+        //             if (local_grid[(y + i) * width + (x + i)] != 50 && local_grid[(y + i) * width + (x + i)] != 100) ++not_free_count;
+        //         }
+        //           if(not_free_count>=18){
+        //             // RCLCPP_INFO(this->get_logger(), "Occupied cell at (%d, %d) has  nearby free cells", not_free_count, not_free_count);
+        //             local_grid[idx] = 0;  // 转为空闲
+        //           }
+        // }
     }
   }
+  std::vector<int8_t> dilated_grid = local_grid;  // 拷贝一个原始副本
+
+  int radius = 1; // 膨胀的半径（格子）
+
+  for (int y = radius; y < height - radius; ++y) {
+      for (int x = radius; x < width - radius; ++x) {
+          int idx = y * width + x;
+
+          // 如果当前格子不是白色，检查邻域内是否有白色
+          if (local_grid[idx] != 0) {
+              bool has_white_neighbor = false;
+
+              for (int dy = -radius; dy <= radius; ++dy) {
+                  for (int dx = -radius; dx <= radius; ++dx) {
+                      int n_idx = (y + dy) * width + (x + dx);
+                      if (local_grid[n_idx] == 0) {
+                          has_white_neighbor = true;
+                          break;
+                      }
+                  }
+                  if (has_white_neighbor) break;
+              }
+
+              // 如果邻域内有白色，当前也变成白色
+              if (has_white_neighbor) {
+                  dilated_grid[idx] = 0;
+              }
+          }
+      }
+  }
+  int radius2 = 1;
+  local_grid = dilated_grid; // 更新为膨胀后的栅格图
+  std::vector<int8_t> eroded_grid = local_grid;
+
+  for (int y = radius2; y < height - radius2; ++y) {
+      for (int x = radius2; x < width - radius2; ++x) {
+          int idx = y * width + x;
+
+          if (local_grid[idx] == 0) {
+              bool all_white = true;
+
+              for (int dy = -radius2; dy <= radius2; ++dy) {
+                  for (int dx = -radius2; dx <= radius2; ++dx) {
+                      int n_idx = (y + dy) * width + (x + dx);
+                      if (local_grid[n_idx] != 0 ) {
+                          all_white = false;
+                          break;
+                      }
+                  }
+                  if (!all_white) break;
+              }
+
+              if (!all_white) {
+                  eroded_grid[idx] = 100;
+              }
+          }
+      }
+  }
+
+  local_grid = eroded_grid;
+  // remove_isolated_obstacles(local_grid, width, height, 5);
+
   // 发布局部地图
   nav_msgs::msg::OccupancyGrid grid_msg;
   grid_msg.header.stamp = this->get_clock()->now();
